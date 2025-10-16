@@ -28,7 +28,7 @@ typedef struct
     // [d]
     const void *output_norm;
     // [dvoc, d]
-    // const void *output_embd;
+    const void *output_embd;
     // nlayer * [d]
     const void *const *attn_norm;
     // nlayer * [ndev, (nh + 2 * nkvh) / ndev * dh, d]

@@ -32,8 +32,8 @@ class LlamaWeightsNaming:
     def output_norm(self):
         return "model.norm.weight"
 
-    # def output_embd(self):
-    #     return "lm_head.weight"
+    def output_embd(self):
+        return "lm_head.weight"
 
     def attn_norm(self, i):
         return f"model.layers.{i}.input_layernorm.weight"
@@ -90,8 +90,11 @@ def convert_glm4_to_llama2_naming(chatglm2_state_dict, config):
 
     new_state_dict = OrderedDict()
     
-    # 前面全部加上model.， 适配llama格式
-    chatglm2_state_dict = {f'model.{key}':value for key,value in chatglm2_state_dict.items()}
+    # 检查是否已经有model.前缀，如果有就不需要再添加
+    sample_key = list(chatglm2_state_dict.keys())[0]
+    if not sample_key.startswith('model.'):
+        # 前面全部加上model.， 适配llama格式
+        chatglm2_state_dict = {f'model.{key}':value for key,value in chatglm2_state_dict.items()}
     
     for key, value in chatglm2_state_dict.items():
         
@@ -121,6 +124,9 @@ def convert_glm4_to_llama2_naming(chatglm2_state_dict, config):
             new_key = key  # 待添加
         elif 'post_mlp_layernorm' in key:
             new_key = key # 待添加
+        elif 'lm_head' in key:
+            # 处理lm_head权重，直接使用不添加model.前缀
+            new_key = key.replace('model.', '')
         else:
             new_key = key
             # print(f"new key: {new_key}")
@@ -243,16 +249,8 @@ class Glm4WeightsImpl(Glm4WeightsCStruct):
             raise ValueError("Unsupported norm weight data type")
 
         
-        input_embd_naming = (
-            naming.input_embd()
-            if naming.input_embd() in state_dict
-            else naming.output_embd()
-        )
-        # output_embd_naming = (
-        #     naming.output_embd()
-        #     if naming.output_embd() in state_dict
-        #     else naming.input_embd()
-        # )
+        input_embd_naming = naming.input_embd()
+        output_embd_naming = naming.output_embd()
         self.transpose_linear_weights = 1 if transpose_weight else 0
         self.nlayer = nlayer
         self.input_embd_tensor = (
@@ -264,12 +262,12 @@ class Glm4WeightsImpl(Glm4WeightsCStruct):
         )
         self.output_norm = self.output_norm_tensor.data_ptr()
         
-        # self.output_embd_tensor = state_dict[output_embd_naming].to(torch_dt_mat)
-        # if not transpose_weight:
-        #     self.output_embd_tensor = self.output_embd_tensor.transpose(
-        #         0, 1
-        #     ).contiguous()
-        # self.output_embd = self.output_embd_tensor.data_ptr()
+        self.output_embd_tensor = state_dict[output_embd_naming].to(torch.float16)
+        if not transpose_weight:
+            self.output_embd_tensor = self.output_embd_tensor.transpose(
+                0, 1
+            ).contiguous()
+        self.output_embd = self.output_embd_tensor.data_ptr()
 
         self.attn_norm_tensors = [
             state_dict[naming.attn_norm(i)].to(torch_dt_norm) for i in range(nlayer)
@@ -591,10 +589,9 @@ class Glm4ForCauslLM:
                     model_dir_path
                 )
         elif "glm4" == config["model_type"]:
-            # state_dict = load_all_safetensors_from_dir(model_dir_path)
-            # model = (transformers.LlamaForCausalLM.from_pretrained(model_dir_path).cpu().half())
-            from transformers import AutoModel
-            model = (AutoModel.from_pretrained(model_dir_path, trust_remote_code=True).cpu().half())
+            # 修复：使用AutoModelForCausalLM来加载完整的模型，包括lm_head
+            from transformers import AutoModelForCausalLM
+            model = (AutoModelForCausalLM.from_pretrained(model_dir_path, trust_remote_code=True).cpu().half())
             state_dict = model.state_dict()
             state_dict = convert_glm4_to_llama2_naming(state_dict,config)
             
@@ -608,6 +605,9 @@ class Glm4ForCauslLM:
                     transpose_weight=transpose_weight,
                 )
                 self.tokenizer = transformers.AutoTokenizer.from_pretrained(model_dir_path,trust_remote_code=True)
+            else:
+                print("[ERROR] LlamaWeightsNaming.match failed for GLM4!")
+                raise ValueError("GLM4 weight naming does not match expected format")
         else:
             raise ValueError("Unsupported model architecture")
 
@@ -701,6 +701,7 @@ class Glm4ForCauslLM:
             output_content += output_str
             print(output_str, end="", flush=True)
             if output_tokens[0] in self.eos_token_id:
+                print(f"\n[DEBUG] EOS token detected, stopping generation")
                 break
             infer_task.next(output_tokens[0])
 
@@ -802,7 +803,7 @@ def test():
 
     ndev = int(sys.argv[3]) if len(sys.argv) > 3 else 1
     model = Glm4ForCauslLM(model_path, device_type, ndev)
-    model.generate("山东最高的山是？", 500)
+    model.generate("山东最高的山是？", 500, topp_=0.9, topk_=50, temperature_=0.7)
     model.destroy_model_instance()
 
 

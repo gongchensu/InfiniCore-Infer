@@ -27,7 +27,7 @@ class Glm4WeightsCStruct(Structure):
         ("transpose_linear_weights", c_int),
         ("input_embd", c_void_p),
         ("output_norm", c_void_p),
-        # ("output_embd", c_void_p),
+        ("output_embd", c_void_p),
         ("attn_norm", POINTER(c_void_p)),
         ("attn_qkv", POINTER(c_void_p)),
         ("attn_qkv_b", POINTER(c_void_p)),

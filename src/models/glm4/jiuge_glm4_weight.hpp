@@ -18,18 +18,18 @@ inline std::shared_ptr<Tensor> getOutNorm(
     return Tensor::weight((char *)w->output_norm, w->dt_norm, shape);
 }
 
-// inline std::shared_ptr<Tensor> getOutEmbd(
-//     Glm4Meta const *meta,
-//     Glm4Weights const *w) {
-//     if (w->transpose_linear_weights != 0) {
-//         auto shape = std::vector<size_t>({meta->dvoc, meta->d});
-//         return Tensor::weight((char *)w->output_embd, meta->dt_logits, shape)
-//             ->permute({1, 0});
-//     } else {
-//         auto shape = std::vector<size_t>({meta->d, meta->dvoc});
-//         return Tensor::weight((char *)w->output_embd, meta->dt_logits, shape);
-//     }
-// }
+inline std::shared_ptr<Tensor> getOutEmbd(
+    Glm4Meta const *meta,
+    Glm4Weights const *w) {
+    if (w->transpose_linear_weights != 0) {
+        auto shape = std::vector<size_t>({meta->dvoc, meta->d});
+        return Tensor::weight((char *)w->output_embd, meta->dt_logits, shape)
+            ->permute({1, 0});
+    } else {
+        auto shape = std::vector<size_t>({meta->d, meta->dvoc});
+        return Tensor::weight((char *)w->output_embd, meta->dt_logits, shape);
+    }
+}
 
 inline std::shared_ptr<Tensor> getAttnNorm(
     Glm4Meta const *meta,

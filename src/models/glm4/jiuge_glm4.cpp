@@ -52,7 +52,7 @@ void createDeviceResource(Glm4DeviceResource *rsrc, const Glm4Meta *meta,
         handle,
         getInEmbd(meta, weights),
         getOutNorm(meta, weights),
-        // getOutEmbd(meta, weights),
+        getOutEmbd(meta, weights),
         getSinTable(meta),
         getCosTable(meta),
         w_attn_norm,
@@ -76,7 +76,7 @@ void releaseDeviceResource(Glm4DeviceResource &res) {
     // Release individual Tensors
     res.w_in_embd.reset();
     res.w_out_norm.reset();
-    // res.w_out_embd.reset();
+    res.w_out_embd.reset();
     res.sin_table.reset();
     res.cos_table.reset();
     for (auto &t : res.w_attn_norm) {
@@ -252,7 +252,7 @@ void inferDeviceBatch(const Glm4Meta &meta, Glm4DeviceResource &rsrc,
         // o_proj, post_attn_norm, residual
         linear(logits_out_buf, o_buf, rsrc.w_attn_out[layer], 1.0, 0.0,  nullptr, nullptr); // only rank 0 adds residual
         rmsnorm(logits_out, logits_out_buf, rsrc.w_self_attn_norm[layer], meta.epsilon);
-        add(logits_out, logits_out, logits_in);
+        add(logits_in, logits_out, logits_in);  // 修复：结果应该存到logits_in，这样才能正确传递给FFN和All_reduce
         
 
         // All_reduce if distributed
@@ -268,50 +268,55 @@ void inferDeviceBatch(const Glm4Meta &meta, Glm4DeviceResource &rsrc,
         swiglu(gate_buf, up_buf, gate_buf);
         linear(logits_out, gate_buf, rsrc.w_ffn_down[layer], 1.0, 0.0,  nullptr, nullptr); // only rank 0 adds residual
 
-        // post_ffn_norm + residual
-        rmsnorm(logits_out_buf, logits_out, rsrc.w_post_ffn_norm[layer], meta.epsilon);
-        add(logits_in, logits_out_buf, logits_in);
-        
-        // All_reduce if distributed
+        // 修复：先All_reduce down_proj的输出，再进行post_ffn_norm和residual
         if (rsrc.comm != nullptr) {
             RUN_INFINI(infinicclAllReduce(
-                logits_in->data(), logits_in->data(), ntok * d, dt_logits,
+                logits_out->data(), logits_out->data(), ntok * d, dt_logits,
                 INFINICCL_SUM, rsrc.comm, stream));
             RUN_INFINI(infinirtStreamSynchronize(stream));
         }
+        
+        // post_ffn_norm + residual
+        rmsnorm(logits_out_buf, logits_out, rsrc.w_post_ffn_norm[layer], meta.epsilon);
+        add(logits_in, logits_out_buf, logits_in);
     }
     // Sample and Output
     if (idev == 0) {
         if (last_logits != nullptr) {
             rmsnorm(logits_out, logits_in, rsrc.w_out_norm, meta.epsilon);
-            //auto last_logits_buf = Tensor::buffer(dt_logits, {ntok, dvoc}, rsrc.memory_pool);
-            //linear(last_logits_buf, logits_out, rsrc.w_out_embd, 1.0, 0.0, nullptr, nullptr);
-            auto last_logits_buf = logits_out;
+            // 修复：使用独立的lm_head权重
+            auto last_logits_buf = Tensor::buffer(dt_logits, {ntok, dvoc}, rsrc.memory_pool);
+            // 使用w_out_embd作为lm_head: [ntok, d] @ [d, dvoc] = [ntok, dvoc]
+            linear(last_logits_buf, logits_out, rsrc.w_out_embd, 1.0, 0.0, nullptr, nullptr);
             RUN_INFINI(infinirtStreamSynchronize(stream));
             RUN_INFINI(infinirtMemcpy(last_logits, last_logits_buf->data(), dsize(dt_logits) * ntok * dvoc, INFINIRT_MEMCPY_D2H));
         }
         if (output != nullptr) {
+            // 修复：创建一个专门的buffer来存储每个请求的最后一个token的hidden state
+            auto output_hidden = Tensor::buffer(dt_logits, {nreq, d}, rsrc.memory_pool);
+            
             size_t token_offset = 0;
             for (uint32_t req = 0; req < nreq; req++) {
                 auto seq_len = req_lens[req];
                 token_offset += seq_len;
-                rmsnorm(logits_out->slice(0, req, 1),
+                // 修复：正确地从logits_in中提取每个请求的最后一个token
+                rmsnorm(output_hidden->slice(0, req, 1),
                         logits_in->slice(0, token_offset - 1, 1),
                         rsrc.w_out_norm,
                         meta.epsilon);
             }
-            //linear(prob_buf, logits_out->slice(0, 0, nreq), rsrc.w_out_embd, 1.0, 0.0, nullptr, nullptr);
-            auto prob_buf = logits_out;
+            
+            // 修复：使用独立的lm_head权重进行投影
+            // [nreq, d] @ [d, dvoc] = [nreq, dvoc]
+            linear(prob_buf, output_hidden, rsrc.w_out_embd, 1.0, 0.0, nullptr, nullptr);
+            
             std::random_device _rd;
             std::mt19937 gen(_rd());
-            token_offset = 0;
             for (uint32_t req = 0; req < nreq; req++) {
-                auto seq_len = req_lens[req];
                 float random_val = std::uniform_real_distribution<float>(0, 1)(gen);
                 randomSample(result_buf->slice(0, req, 1)->view_as({}, {}),
                              prob_buf->slice(0, req, 1)->view_as({dvoc}, {1}),
                              random_val, topp[req], topk[req], temperature[req]);
-                token_offset += seq_len;
             }
             RUN_INFINI(infinirtStreamSynchronize(stream));
             RUN_INFINI(infinirtMemcpy(result_cpu.data(), result_buf->data(),
